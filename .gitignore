@@ -1,0 +1,10 @@
+# Python-Bytecode & Node
+__pycache__/
+*.py[cod]
+node_modules/
+
+# Betriebssystem- & Editor-Dateien
+.DS_Store
+Thumbs.db
+*.swp
+*~

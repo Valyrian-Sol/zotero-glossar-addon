@@ -1,0 +1,21 @@
+{
+  "manifest_version": 2,
+  "name": "PDF Glossar & Definitionen",
+  "version": "1.0.4",
+  "description": "Ausdrücke, Buchstaben und Wortgruppen in PDFs lokal oder global definieren und per Hover anzeigen.",
+  "author": "PDF Glossar Contributors",
+  "icons": {
+    "32": "icons/icon.svg",
+    "48": "icons/icon.svg",
+    "64": "icons/icon.svg",
+    "96": "icons/icon.svg"
+  },
+  "applications": {
+    "zotero": {
+      "id": "pdf-definitions@zotero-addon.local",
+      "update_url": "https://example.com/zotero-pdf-definitions/updates.json",
+      "strict_min_version": "8.0",
+      "strict_max_version": "11.*"
+    }
+  }
+}
