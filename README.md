@@ -37,7 +37,7 @@ Die fertige `.xpi`-Datei liegt direkt im Repository unter [`zotero-pdf-definitio
 ## Neu bauen & Tests ausführen
 
 ```bash
-git clone <REPO-URL>
+git clone https://github.com/Valyrian-Sol/zotero-glossar-addon.git
 cd zotero-glossar-addon
 
 # .xpi Paket neu bauen
