@@ -289,4 +289,121 @@ function makeCharsFromLines(lines) {
   assert.strictEqual(cLowerE.globalMatch, null, "Kleines 'e' darf nicht mit großem 'E' kollidieren");
 }
 
+// 6. Test: Toolbar-Button-Positionierung & Struktur (kein Umbruch im 28x28 Standard-Button)
+{
+  let injectedStyle = null;
+  const makeEl = (tag) => {
+    const el = {
+      tagName: tag.toUpperCase(),
+      id: "",
+      className: "",
+      type: "",
+      title: "",
+      hidden: false,
+      textContent: "",
+      dataset: {},
+      children: [],
+      childNodes: [],
+      ownerDocument: null,
+      setAttribute(k, v) {
+        this[k] = v;
+      },
+      appendChild(child) {
+        this.children.push(child);
+        this.childNodes.push(child);
+        return child;
+      },
+      replaceChildren(...nodes) {
+        this.children = [...nodes];
+        this.childNodes = [...nodes];
+      },
+      addEventListener() {},
+    };
+    Object.defineProperty(el, "textContent", {
+      get() {
+        if (this.children.length > 0) {
+          return this.children.map((c) => c.textContent).join("");
+        }
+        return this._text || "";
+      },
+      set(v) {
+        this._text = String(v);
+        this.children = [];
+        this.childNodes = [];
+      },
+    });
+    return el;
+  };
+
+  const fakeDoc = {
+    documentElement: {
+      getAttribute: () => "dark",
+      setAttribute: () => {},
+      removeAttribute: () => {},
+    },
+    head: {
+      appendChild(el) {
+        if (el.id === "zpdf-def-styles") injectedStyle = el;
+      },
+    },
+    body: {
+      appendChild() {},
+    },
+    getElementById(id) {
+      if (id === "zpdf-def-styles") return injectedStyle;
+      return null;
+    },
+    createElement(tag) {
+      const el = makeEl(tag);
+      el.ownerDocument = fakeDoc;
+      return el;
+    },
+  };
+
+  const fakeReader = {
+    type: "pdf",
+    itemID: 42,
+    _iframeWindow: {
+      document: fakeDoc,
+      matchMedia: () => ({ matches: true }),
+    },
+  };
+
+  global.Zotero = {
+    debug: () => {},
+    Prefs: { get: () => null, set: () => {} },
+    Reader: { _readers: [fakeReader] },
+  };
+
+  const addon = new ZoteroPDFDefinitions({
+    id: "pdf-definitions@zotero-addon.local",
+    version: "1.0.5",
+    rootURI: "",
+  });
+
+  let appendedBtn = null;
+  addon.onRenderToolbar({
+    reader: fakeReader,
+    doc: fakeDoc,
+    append: (btn) => {
+      appendedBtn = btn;
+    },
+  });
+
+  assert.ok(injectedStyle, "Stylesheet #zpdf-def-styles muss injiziert werden");
+  assert.ok(
+    injectedStyle.textContent.includes("width: auto !important;"),
+    "Toolbar-Button muss Zoteros 28px-Fixbreite mit 'width: auto !important;' überschreiben"
+  );
+  assert.ok(
+    injectedStyle.textContent.includes("white-space: nowrap !important;"),
+    "Toolbar-Button muss Zeilenumbruch mit 'white-space: nowrap !important;' verhindern"
+  );
+  assert.ok(appendedBtn, "Toolbar-Button muss per append() eingehängt werden");
+  assert.strictEqual(appendedBtn.children.length, 2, "Button muss Icon-Span und Label-Span enthalten");
+  assert.strictEqual(appendedBtn.children[0].className, "zpdf-toolbar-icon");
+  assert.strictEqual(appendedBtn.children[1].className, "zpdf-toolbar-label");
+  assert.strictEqual(appendedBtn.textContent, "📖 Glossar (0)");
+}
+
 console.log("Alle Add-on Tests erfolgreich bestanden (OK).");

@@ -751,9 +751,17 @@ class ZoteroPDFDefinitions {
     const doc = rWin.document;
     this.applyThemeToReader(reader);
 
-    if (!doc.getElementById("zpdf-def-styles")) {
-      const style = doc.createElement("style");
+    let style = doc.getElementById("zpdf-def-styles");
+    const isNewStyle = !style;
+    if (isNewStyle) {
+      style = doc.createElement("style");
       style.id = "zpdf-def-styles";
+    }
+    const styleVer = this.version || "1.0.5";
+    if (isNewStyle || style.dataset?.zpdfVersion !== styleVer) {
+      if (style.dataset) {
+        style.dataset.zpdfVersion = styleVer;
+      }
       style.textContent = `
         :root {
           --zpdf-color-scheme: light;
@@ -1142,27 +1150,65 @@ class ZoteroPDFDefinitions {
           background: var(--zpdf-danger-hover);
         }
 
-        .zpdf-toolbar-btn {
-          box-sizing: border-box;
+        .toolbar .custom-sections {
           display: inline-flex;
           align-items: center;
-          justify-content: center;
-          gap: 4px;
-          padding: 3px 8px;
-          margin: 0 3px;
-          border-radius: 5px;
-          border: 1px solid var(--zpdf-border-subtle);
+        }
+        .toolbar .custom-sections .section {
+          display: inline-flex;
+          align-items: center;
+        }
+
+        .toolbar .toolbar-button.zpdf-toolbar-btn,
+        .toolbar-button.zpdf-toolbar-btn,
+        .zpdf-toolbar-btn {
+          box-sizing: border-box !important;
+          display: inline-flex !important;
+          flex-direction: row !important;
+          flex-wrap: nowrap !important;
+          align-items: center !important;
+          justify-content: center !important;
+          width: auto !important;
+          min-width: 28px !important;
+          height: 28px !important;
+          min-height: 28px !important;
+          max-height: 28px !important;
+          gap: 5px !important;
+          padding: 0 9px !important;
+          margin: 0 !important;
+          border-radius: 5px !important;
+          border: 1px solid var(--zpdf-border-subtle) !important;
           background: transparent;
           color: var(--fill-primary, var(--zpdf-fg));
           font-family: system-ui, -apple-system, sans-serif;
           font-size: 11.5px;
           font-weight: 600;
+          line-height: 1 !important;
+          white-space: nowrap !important;
+          flex-shrink: 0 !important;
           cursor: pointer;
           user-select: none;
+          -moz-window-dragging: no-drag;
         }
+        .toolbar .toolbar-button.zpdf-toolbar-btn:hover,
+        .toolbar-button.zpdf-toolbar-btn:hover,
         .zpdf-toolbar-btn:hover {
           background: var(--zpdf-accent-soft);
-          border-color: var(--zpdf-accent);
+          border-color: var(--zpdf-accent) !important;
+        }
+        .zpdf-toolbar-icon {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 13px;
+          line-height: 1;
+          flex-shrink: 0;
+        }
+        .zpdf-toolbar-label {
+          display: inline-flex;
+          align-items: center;
+          line-height: 1;
+          white-space: nowrap;
         }
 
         .zpdf-badge {
@@ -1384,7 +1430,9 @@ class ZoteroPDFDefinitions {
           padding: 8px 2px;
         }
       `;
-      doc.head.appendChild(style);
+      if (isNewStyle) {
+        doc.head.appendChild(style);
+      }
     }
 
     let tooltip = doc.getElementById("zpdf-hover-tooltip");
@@ -1774,6 +1822,46 @@ class ZoteroPDFDefinitions {
     }
   }
 
+  setToolbarButtonContent(btn, count) {
+    const doc = btn?.ownerDocument;
+    if (!doc || typeof doc.createElement !== "function" || typeof btn.replaceChildren !== "function") {
+      btn.textContent = `📖 Glossar (${count})`;
+      return;
+    }
+    btn.replaceChildren();
+    const iconSpan = doc.createElement("span");
+    iconSpan.className = "zpdf-toolbar-icon";
+    iconSpan.setAttribute("aria-hidden", "true");
+    iconSpan.textContent = "📖";
+
+    const labelSpan = doc.createElement("span");
+    labelSpan.className = "zpdf-toolbar-label";
+    labelSpan.textContent = ` Glossar (${count})`;
+
+    btn.appendChild(iconSpan);
+    btn.appendChild(labelSpan);
+  }
+
+  createToolbarButton(reader, doc) {
+    const docKey = this.getDocKey(reader);
+    const activeCount = this.getActiveDefinitionsForDoc(docKey).length;
+
+    const btn = doc.createElement("button");
+    btn.type = "button";
+    btn.className = "toolbar-button zpdf-toolbar-btn";
+    btn.title = "Definierte Ausdrücke & Glossar für dieses PDF und global verwalten";
+    btn.dataset.zpdfToolbarCount = "true";
+    btn._zpdfOwner = this;
+    this.setToolbarButtonContent(btn, activeCount);
+
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.openGlossaryModal(reader);
+    });
+
+    return btn;
+  }
+
   /**
    * 2. Handler für die PDF-Reader-Toolbar (`renderToolbar`):
    *    Fügt einen Button "📖 Glossar" hinzu, über den alle lokalen & globalen Definitionen
@@ -1783,21 +1871,7 @@ class ZoteroPDFDefinitions {
     try {
       const { reader, doc, append } = event;
       this.ensureReaderUI(reader);
-      const docKey = this.getDocKey(reader);
-      const activeCount = this.getActiveDefinitionsForDoc(docKey).length;
-
-      const btn = doc.createElement("button");
-      btn.type = "button";
-      btn.className = "toolbar-button zpdf-toolbar-btn";
-      btn.title = "Definierte Ausdrücke & Glossar für dieses PDF und global verwalten";
-      btn.dataset.zpdfToolbarCount = "true";
-      btn.textContent = `📖 Glossar (${activeCount})`;
-
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        this.openGlossaryModal(reader);
-      });
-
+      const btn = this.createToolbarButton(reader, doc);
       append(btn);
     } catch (err) {
       this.log(`Fehler in onRenderToolbar: ${err}`);
@@ -2222,8 +2296,33 @@ class ZoteroPDFDefinitions {
     for (const reader of readers) {
       if (!reader || reader.type !== "pdf" || !reader._iframeWindow) continue;
       this.ensureReaderUI(reader);
+      this.ensureToolbarButtonInReader(reader);
       this.attachToReaderViews(reader);
     }
+  }
+
+  ensureToolbarButtonInReader(reader) {
+    try {
+      const doc = reader?._iframeWindow?.document;
+      if (!doc || typeof doc.querySelectorAll !== "function") return;
+      const existingBtns = doc.querySelectorAll(".zpdf-toolbar-btn");
+      if (existingBtns.length > 0) {
+        for (const oldBtn of existingBtns) {
+          if (oldBtn._zpdfOwner !== this && typeof oldBtn.replaceWith === "function") {
+            const freshBtn = this.createToolbarButton(reader, doc);
+            oldBtn.replaceWith(freshBtn);
+          }
+        }
+        return;
+      }
+      const customSections = doc.querySelector?.(".toolbar .custom-sections");
+      if (customSections) {
+        const section = doc.createElement("div");
+        section.className = "section zpdf-toolbar-section";
+        section.appendChild(this.createToolbarButton(reader, doc));
+        customSections.appendChild(section);
+      }
+    } catch (_) {}
   }
 
   attachToReaderViews(reader) {
@@ -2368,7 +2467,7 @@ class ZoteroPDFDefinitions {
       const count = this.getActiveDefinitionsForDoc(docKey).length;
       const btns = doc.querySelectorAll("[data-zpdf-toolbar-count]");
       for (const btn of btns) {
-        btn.textContent = `📖 Glossar (${count})`;
+        this.setToolbarButtonContent(btn, count);
       }
     } catch (_) {}
   }
@@ -2757,6 +2856,15 @@ class ZoteroPDFDefinitions {
         doc.getElementById("zpdf-def-styles")?.remove();
         doc.getElementById("zpdf-hover-tooltip")?.remove();
         doc.getElementById("zpdf-modal-backdrop")?.remove();
+        if (typeof doc.querySelectorAll === "function") {
+          for (const btn of doc.querySelectorAll(".zpdf-toolbar-btn")) {
+            const parentSection = btn.closest?.(".section");
+            btn.remove();
+            if (parentSection && parentSection.childNodes.length === 0) {
+              parentSection.remove();
+            }
+          }
+        }
       }
       const internalReader =
         reader?._internalReader?.wrappedJSObject || reader?._internalReader;
