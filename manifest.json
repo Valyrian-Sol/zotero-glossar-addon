@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "PDF Glossar & Definitionen",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Ausdrücke, Buchstaben und Wortgruppen in PDFs lokal oder global definieren und per Hover anzeigen.",
   "author": "PDF Glossar Contributors",
   "icons": {

@@ -6,6 +6,7 @@ const {
   ZoteroPDFDefinitions,
   inferDefaultMatchOptions,
   findMatchesInPageChars,
+  convertPdfRectToViewport,
 } = require("./chrome/content/main.js");
 
 function makeCharsFromLines(lines) {
@@ -404,6 +405,265 @@ function makeCharsFromLines(lines) {
   assert.strictEqual(appendedBtn.children[0].className, "zpdf-toolbar-icon");
   assert.strictEqual(appendedBtn.children[1].className, "zpdf-toolbar-label");
   assert.strictEqual(appendedBtn.textContent, "📖 Glossar (0)");
+}
+
+// 7. Test: Schutz vor Backspace-Schließen im Selection-Popup und Modal (Issue #1)
+{
+  const makeEl = (tag) => {
+    const el = {
+      tagName: tag.toUpperCase(),
+      id: "",
+      className: "",
+      type: "",
+      title: "",
+      hidden: false,
+      textContent: "",
+      dataset: {},
+      children: [],
+      childNodes: [],
+      ownerDocument: null,
+      _attributes: new Map(),
+      setAttribute(k, v) {
+        this._attributes.set(k, String(v));
+        this[k] = v;
+      },
+      getAttribute(k) {
+        return this._attributes.get(k) || null;
+      },
+      appendChild(child) {
+        this.children.push(child);
+        this.childNodes.push(child);
+        return child;
+      },
+      replaceChildren(...nodes) {
+        this.children = [...nodes];
+        this.childNodes = [...nodes];
+      },
+      addEventListener() {},
+      classList: {
+        add(c) {
+          if (!el.className.includes(c)) el.className += " " + c;
+        },
+        remove(c) {
+          el.className = el.className.replace(new RegExp(`\\b${c}\\b`, "g"), "").trim();
+        },
+        toggle(c, state) {
+          if (state) this.add(c);
+          else this.remove(c);
+        },
+        contains(c) {
+          return el.className.includes(c);
+        },
+      },
+    };
+    return el;
+  };
+
+  const fakeDoc = {
+    documentElement: {
+      getAttribute: () => "light",
+      setAttribute: () => {},
+      removeAttribute: () => {},
+    },
+    head: { appendChild() {} },
+    body: { appendChild() {} },
+    getElementById: () => null,
+    createElement(tag) {
+      const el = makeEl(tag);
+      el.ownerDocument = fakeDoc;
+      return el;
+    },
+  };
+
+  const fakeReader = {
+    type: "pdf",
+    itemID: 101,
+    _item: { libraryID: 1, key: "AUC4RVJM", getDisplayTitle: () => "Test Document" },
+    _iframeWindow: {
+      document: fakeDoc,
+      matchMedia: () => ({ matches: false }),
+    },
+  };
+
+  const addon = new ZoteroPDFDefinitions({
+    id: "pdf-definitions@zotero-addon.local",
+    version: "1.0.6",
+    rootURI: "",
+  });
+
+  let selectionBox = null;
+  addon.onRenderTextSelectionPopup({
+    reader: fakeReader,
+    doc: fakeDoc,
+    params: { annotation: { text: "Inflation" } },
+    append: (box) => {
+      selectionBox = box;
+    },
+  });
+
+  assert.ok(selectionBox, "Selection-Box muss gerendert werden");
+  assert.ok(
+    selectionBox.className.includes("label-popup") && selectionBox.className.includes("preview-popup"),
+    "Selection-Box muss .label-popup und .preview-popup Klassen besitzen, damit Zoteros KeyboardManager kein deleteAnnotations aufruft"
+  );
+
+  const termInput = selectionBox.children.find((c) => c.className === "zpdf-input");
+  const defInput = selectionBox.children.find((c) => c.className === "zpdf-textarea");
+  assert.ok(termInput, "Term-Input muss vorhanden sein");
+  assert.ok(defInput, "Def-Input muss vorhanden sein");
+  assert.strictEqual(
+    termInput.getAttribute("contenteditable"),
+    "true",
+    "Term-Input muss contenteditable='true' besitzen (Zotero FocusManager Schutz)"
+  );
+  assert.strictEqual(
+    defInput.getAttribute("contenteditable"),
+    "true",
+    "Def-Textarea muss contenteditable='true' besitzen (Zotero FocusManager Schutz)"
+  );
+}
+
+// 8. Test: Hover-Erkennung, Viewport-Transformation und Markierungs-Rendering (Issue #2)
+{
+  // 1. Viewport Transform Matrix [scaleX, skewY, skewX, scaleY, transX, transY]
+  const viewport = {
+    transform: [1.5, 0, 0, -1.5, 0, 1000],
+    scale: 1.5,
+    rotation: 0,
+  };
+  const pdfRect = [100, 200, 150, 220]; // [x1, y1, x2, y2]
+  const vpRect = convertPdfRectToViewport(viewport, pdfRect);
+  assert.ok(vpRect, "convertPdfRectToViewport muss ein Ergebnis liefern");
+  assert.strictEqual(vpRect[0], 100 * 1.5 + 0, "x1 korrekt skaliert");
+  assert.strictEqual(vpRect[1], 200 * -1.5 + 1000, "y1 korrekt invertiert/verschoben");
+  assert.strictEqual(vpRect[2], 150 * 1.5 + 0, "x2 korrekt skaliert");
+  assert.strictEqual(vpRect[3], 220 * -1.5 + 1000, "y2 korrekt invertiert/verschoben");
+
+  // 2. indexAndRenderPage mit Definition und subtleHint
+  const addon = new ZoteroPDFDefinitions({
+    id: "pdf-definitions@zotero-addon.local",
+    version: "1.0.6",
+    rootURI: "",
+  });
+  addon.subtleHint = true;
+  addon.upsertDefinition({
+    id: "def_test_alp",
+    term: "ALP",
+    definition: "American Life Panel",
+    scope: "pdf",
+    docKey: "1:AUC4RVJM",
+    caseSensitive: true,
+    wholeWord: true,
+  });
+
+  const chars = [
+    { c: "A", u: "A", ignorable: false, rect: [100, 200, 110, 220], inlineRect: [100, 200, 110, 220] },
+    { c: "L", u: "L", ignorable: false, rect: [110, 200, 120, 220], inlineRect: [110, 200, 120, 220] },
+    { c: "P", u: "P", ignorable: false, spaceAfter: true, rect: [120, 200, 130, 220], inlineRect: [120, 200, 130, 220] },
+  ];
+
+  const makeMockEl = (tag) => {
+    const el = {
+      tagName: tag.toUpperCase(),
+      id: "",
+      className: "",
+      style: {},
+      dataset: {},
+      children: [],
+      childNodes: [],
+      _attrs: new Map(),
+      setAttribute(k, v) {
+        this._attrs.set(k, String(v));
+      },
+      getAttribute(k) {
+        return this._attrs.get(k) || null;
+      },
+      appendChild(c) {
+        this.children.push(c);
+        this.childNodes.push(c);
+        return c;
+      },
+      replaceChildren(...nodes) {
+        this.children = [...nodes];
+        this.childNodes = [...nodes];
+      },
+      querySelector(sel) {
+        if (sel.includes(".zpdf-def-layer")) {
+          return this.children.find((c) => c.className.includes("zpdf-def-layer")) || null;
+        }
+        return null;
+      },
+      classList: {
+        add(c) {
+          if (!el.className.includes(c)) el.className += " " + c;
+        },
+        remove(c) {
+          el.className = el.className.replace(new RegExp(`\\b${c}\\b`, "g"), "").trim();
+        },
+        toggle(c, state) {
+          if (state) this.add(c);
+          else this.remove(c);
+        },
+      },
+    };
+    return el;
+  };
+
+  const mockPdfDoc = {
+    createElement: makeMockEl,
+  };
+  const pageDiv = makeMockEl("div");
+  pageDiv.className = "page";
+  pageDiv.ownerDocument = mockPdfDoc;
+
+  const mockPageView = {
+    div: pageDiv,
+    viewport,
+  };
+
+  const mockPdfView = {
+    _pdfPages: [{ chars }],
+    _iframeWindow: {
+      document: mockPdfDoc,
+      PDFViewerApplication: {
+        pdfViewer: {
+          _pages: [mockPageView],
+        },
+      },
+    },
+  };
+
+  const fakeReader = {
+    type: "pdf",
+    itemID: 101,
+    _item: { libraryID: 1, key: "AUC4RVJM", getDisplayTitle: () => "Test Document" },
+    _iframeWindow: {
+      document: {
+        documentElement: { getAttribute: () => "light" },
+        getElementById: () => null,
+      },
+    },
+  };
+
+  addon.indexAndRenderPage(fakeReader, mockPdfView, 0);
+
+  const layer = pageDiv.querySelector(".zpdf-def-layer");
+  assert.ok(layer, "Layer .zpdf-def-layer muss im Page-Div angelegt werden");
+  assert.ok(
+    layer.className.includes("zpdf-subtle-hint"),
+    "Layer muss Klasse zpdf-subtle-hint besitzen wenn subtleHint aktiv ist"
+  );
+  assert.strictEqual(layer.children.length, 1, "Genau ein Markierungselement für 'ALP' muss existieren");
+
+  const mark = layer.children[0];
+  assert.strictEqual(mark.className, "zpdf-def-mark");
+  assert.strictEqual(
+    mark.getAttribute("data-zpdf-def-id"),
+    "def_test_alp",
+    "Markierung muss data-zpdf-def-id Attribut mit der Definitions-ID besitzen"
+  );
+  assert.ok(parseFloat(mark.style.width) > 0, "Markierungsbreite muss > 0 sein");
+  assert.ok(parseFloat(mark.style.height) > 0, "Markierungshöhe muss > 0 sein");
 }
 
 console.log("Alle Add-on Tests erfolgreich bestanden (OK).");

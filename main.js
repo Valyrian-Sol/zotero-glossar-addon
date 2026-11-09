@@ -6,6 +6,106 @@ const PREF_SUBTLE_HINT_KEY = "extensions.pdf-definitions.subtleHint";
 const PREF_THEME_KEY = "extensions.pdf-definitions.theme"; // "auto" | "dark" | "light"
 
 /**
+ * Hebt Xray-Waiver (`wrappedJSObject` / `WaivedXrayWrapper`) für DOM-Knoten, Windows oder Promises wieder auf,
+ * damit Standard-DOM-APIs (`addEventListener`, `createElement`, `getBoundingClientRect` usw.)
+ * ohne SpiderMonkey-Permission-Denied-Fehler aufgerufen werden können.
+ */
+function unwaive(obj) {
+  if (!obj) return obj;
+  try {
+    if (typeof Components !== "undefined" && Components.utils?.unwaiveXrays) {
+      return Components.utils.unwaiveXrays(obj);
+    }
+  } catch (_) {}
+  return obj;
+}
+
+/**
+ * Liefert das `wrappedJSObject` (WaivedXrayWrapper) eines Content-Objekts, um auf benutzerdefinierte
+ * JS-Properties (wie `PDFViewerApplication`, `_pdfPages`, `_pages` usw.) zuzugreifen.
+ */
+function waive(obj) {
+  if (!obj) return obj;
+  try {
+    if (obj.wrappedJSObject) return obj.wrappedJSObject;
+    if (typeof Components !== "undefined" && Components.utils?.waiveXrays) {
+      return Components.utils.waiveXrays(obj);
+    }
+  } catch (_) {}
+  return obj;
+}
+
+/**
+ * Wartet sicher auf ein Promise aus einem Content-Compartment (`WaivedXrayWrapper`), indem
+ * `resolve`/`reject`-Callbacks per `Components.utils.exportFunction` in den Content-Scope exportiert werden.
+ */
+function awaitContentPromise(thenable, contentWin) {
+  if (!thenable) return Promise.resolve(undefined);
+  try {
+    if (
+      contentWin &&
+      typeof Components !== "undefined" &&
+      typeof Components.utils?.exportFunction === "function" &&
+      typeof thenable.then === "function"
+    ) {
+      const targetScope = unwaive(contentWin);
+      return new Promise((resolve, reject) => {
+        const resFn = Components.utils.exportFunction((val) => resolve(val), targetScope);
+        const rejFn = Components.utils.exportFunction((err) => reject(err), targetScope);
+        thenable.then(resFn, rejFn);
+      });
+    }
+  } catch (_) {}
+  try {
+    const clean = unwaive(thenable);
+    if (clean && typeof clean.then === "function") {
+      return Promise.resolve(clean);
+    }
+  } catch (_) {}
+  return Promise.resolve(thenable);
+}
+
+/**
+ * Transformiert ein PDF-Rechteck `[x1, y1, x2, y2]` mithilfe von `viewport.transform` (`[m0..m5]`)
+ * direkt in Viewport-Koordinaten, ohne ein System-Principal-Array an ein Waived-Content-Objekt
+ * übergeben zu müssen (`Permission denied to access property 0`).
+ */
+function convertPdfRectToViewport(viewport, pdfRect) {
+  if (!viewport || !pdfRect || typeof pdfRect.length !== "number" || pdfRect.length < 4) {
+    return null;
+  }
+  const tr = viewport.transform;
+  if (tr && typeof tr.length === "number" && tr.length >= 6) {
+    const m0 = Number(tr[0]);
+    const m1 = Number(tr[1]);
+    const m2 = Number(tr[2]);
+    const m3 = Number(tr[3]);
+    const m4 = Number(tr[4]);
+    const m5 = Number(tr[5]);
+    if (
+      !Number.isNaN(m0) &&
+      !Number.isNaN(m1) &&
+      !Number.isNaN(m2) &&
+      !Number.isNaN(m3) &&
+      !Number.isNaN(m4) &&
+      !Number.isNaN(m5)
+    ) {
+      const x1 = Number(pdfRect[0]) * m0 + Number(pdfRect[1]) * m2 + m4;
+      const y1 = Number(pdfRect[0]) * m1 + Number(pdfRect[1]) * m3 + m5;
+      const x2 = Number(pdfRect[2]) * m0 + Number(pdfRect[3]) * m2 + m4;
+      const y2 = Number(pdfRect[2]) * m1 + Number(pdfRect[3]) * m3 + m5;
+      return [x1, y1, x2, y2];
+    }
+  }
+  if (typeof viewport.convertToViewportRectangle === "function") {
+    try {
+      return viewport.convertToViewportRectangle(pdfRect);
+    } catch (_) {}
+  }
+  return null;
+}
+
+/**
  * Normalisiert Whitespace innerhalb eines Ausdrucks (mehrere Leerzeichen/Zeilenumbrüche -> ein Leerzeichen).
  */
 function normalizeWhitespace(str) {
@@ -47,7 +147,7 @@ function inferDefaultMatchOptions(term) {
  * sowie ein Mapping `charIdxMap`, das für jede String-Position den Index in `chars` speichert.
  */
 function buildSearchableTextFromChars(chars) {
-  if (!Array.isArray(chars) || chars.length === 0) {
+  if (!chars || typeof chars.length !== "number" || chars.length === 0) {
     return { text: "", charIdxMap: [] };
   }
   const outChars = [];
@@ -86,20 +186,26 @@ function buildSearchableTextFromChars(chars) {
 function computeRectsFromCharsSlice(charsSlice) {
   const lineRects = [];
   let currentLineRect = null;
+  if (!charsSlice || typeof charsSlice.length !== "number") return lineRects;
 
-  for (const ch of charsSlice) {
+  for (let i = 0; i < charsSlice.length; i++) {
+    const ch = charsSlice[i];
     if (!ch || ch.ignorable) continue;
     const r = ch.inlineRect || ch.rect;
-    if (!Array.isArray(r) || r.length < 4) continue;
+    if (!r || typeof r.length !== "number" || r.length < 4) continue;
+    const r0 = Number(r[0]);
+    const r1 = Number(r[1]);
+    const r2 = Number(r[2]);
+    const r3 = Number(r[3]);
 
     if (!currentLineRect) {
-      currentLineRect = [r[0], r[1], r[2], r[3]];
+      currentLineRect = [r0, r1, r2, r3];
     } else {
       currentLineRect = [
-        Math.min(currentLineRect[0], r[0]),
-        Math.min(currentLineRect[1], r[1]),
-        Math.max(currentLineRect[2], r[2]),
-        Math.max(currentLineRect[3], r[3]),
+        Math.min(currentLineRect[0], r0),
+        Math.min(currentLineRect[1], r1),
+        Math.max(currentLineRect[2], r2),
+        Math.max(currentLineRect[3], r3),
       ];
     }
 
@@ -119,7 +225,13 @@ function computeRectsFromCharsSlice(charsSlice) {
  * Sucht alle Vorkommen der aktiven Definitionen innerhalb eines `chars`-Arrays einer PDF-Seite.
  */
 function findMatchesInPageChars(chars, definitions) {
-  if (!Array.isArray(chars) || !chars.length || !Array.isArray(definitions) || !definitions.length) {
+  if (
+    !chars ||
+    typeof chars.length !== "number" ||
+    !chars.length ||
+    !Array.isArray(definitions) ||
+    !definitions.length
+  ) {
     return [];
   }
 
@@ -174,7 +286,10 @@ function findMatchesInPageChars(chars, definitions) {
         const startCharIndex = charIdxMap[idx];
         const endCharIndex = charIdxMap[endIdx - 1];
         if (startCharIndex !== undefined && endCharIndex !== undefined && endCharIndex >= startCharIndex) {
-          const slice = chars.slice(startCharIndex, endCharIndex + 1);
+          const slice = [];
+          for (let cIdx = startCharIndex; cIdx <= endCharIndex; cIdx++) {
+            slice.push(chars[cIdx]);
+          }
           const rects = computeRectsFromCharsSlice(slice);
           if (rects.length > 0) {
             matches.push({
@@ -200,8 +315,9 @@ class ZoteroPDFDefinitions {
     this.version = version;
     this.rootURI = rootURI;
     this.definitions = [];
-    this.subtleHint = false;
+    this.subtleHint = true;
     this.themeMode = "auto"; // "auto" | "dark" | "light"
+    this._defsStamp = 1;
     this._saveTimer = null;
     this._readerPollInterval = null;
     this._hookedReaders = new WeakSet();
@@ -287,6 +403,7 @@ class ZoteroPDFDefinitions {
     }
 
     this.definitions = Array.isArray(loaded) ? loaded : [];
+    this._defsStamp = (this._defsStamp || 0) + 1;
     this.log(`${this.definitions.length} Definition(en) geladen (Theme: ${this.themeMode}).`);
   }
 
@@ -423,14 +540,14 @@ class ZoteroPDFDefinitions {
       }
 
       // Auch auf die inneren PDF.js-Dokumente spiegeln
-      const internalReader =
-        reader._internalReader?.wrappedJSObject || reader._internalReader;
+      const internalReader = waive(reader._internalReader);
       const views = [internalReader?._primaryView, internalReader?._secondaryView].filter(
         Boolean
       );
-      for (const v of views) {
-        const uw = v.wrappedJSObject || v;
-        const pDoc = uw?._iframeWindow?.document;
+      for (let i = 0; i < views.length; i++) {
+        const uw = waive(views[i]);
+        const pWin = unwaive(uw?._iframeWindow);
+        const pDoc = unwaive(pWin?.document);
         if (pDoc?.documentElement) {
           pDoc.documentElement.setAttribute("data-zpdf-theme", effectiveTheme);
         }
@@ -634,7 +751,7 @@ class ZoteroPDFDefinitions {
       existing.updatedAt = now;
     } else {
       existing = {
-        id: `def_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        id: id || `def_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
         term: cleanTerm,
         definition: cleanDef,
         scope: targetScope,
@@ -648,6 +765,7 @@ class ZoteroPDFDefinitions {
       this.definitions.push(existing);
     }
 
+    this._defsStamp = (this._defsStamp || 0) + 1;
     this.saveStore();
     this.refreshAllReaders();
     return existing;
@@ -657,6 +775,7 @@ class ZoteroPDFDefinitions {
     const before = this.definitions.length;
     this.definitions = this.definitions.filter((d) => d.id !== id);
     if (this.definitions.length !== before) {
+      this._defsStamp = (this._defsStamp || 0) + 1;
       this.saveStore();
       this.refreshAllReaders();
       return true;
@@ -757,7 +876,7 @@ class ZoteroPDFDefinitions {
       style = doc.createElement("style");
       style.id = "zpdf-def-styles";
     }
-    const styleVer = this.version || "1.0.5";
+    const styleVer = this.version || "1.0.6";
     if (isNewStyle || style.dataset?.zpdfVersion !== styleVer) {
       if (style.dataset) {
         style.dataset.zpdfVersion = styleVer;
@@ -861,29 +980,44 @@ class ZoteroPDFDefinitions {
           margin: 0 !important;
         }
 
-        .zpdf-selection-box {
-          display: flex;
-          flex-direction: column;
-          gap: 6px;
-          width: 100%;
-          min-width: 0;
-          max-width: 100%;
-          box-sizing: border-box;
-          padding: 2px 0 0 0;
-          margin: 0;
-          border: none;
+        .zpdf-selection-box,
+        .zpdf-selection-box.label-popup.preview-popup {
+          position: static !important;
+          left: auto !important;
+          top: auto !important;
+          display: flex !important;
+          flex-direction: column !important;
+          gap: 6px !important;
+          width: 100% !important;
+          min-width: 0 !important;
+          max-width: 100% !important;
+          max-height: none !important;
+          box-sizing: border-box !important;
+          padding: 2px 0 0 0 !important;
+          margin: 0 !important;
+          border: none !important;
+          background: transparent !important;
+          box-shadow: none !important;
           font-family: system-ui, -apple-system, sans-serif;
           font-size: 12px;
           color: var(--zpdf-fg);
           color-scheme: var(--zpdf-color-scheme);
+          -moz-user-select: text !important;
+          user-select: text !important;
+        }
+        .zpdf-selection-box.label-popup.preview-popup::before,
+        .zpdf-selection-box.label-popup.preview-popup::after {
+          display: none !important;
+          content: none !important;
         }
 
         /* Falls der Nutzer manuell Lightmode in einem dunklen Zotero-Popup erzwingt (oder umgekehrt) */
-        :root[data-zpdf-contrast-card="true"] .zpdf-selection-box {
-          background: var(--zpdf-bg);
-          padding: 7px;
-          border-radius: 6px;
-          border: 1px solid var(--zpdf-border);
+        :root[data-zpdf-contrast-card="true"] .zpdf-selection-box,
+        :root[data-zpdf-contrast-card="true"] .zpdf-selection-box.label-popup.preview-popup {
+          background: var(--zpdf-bg) !important;
+          padding: 7px !important;
+          border-radius: 6px !important;
+          border: 1px solid var(--zpdf-border) !important;
         }
 
         .zpdf-selection-header {
@@ -1325,19 +1459,30 @@ class ZoteroPDFDefinitions {
         .zpdf-modal-backdrop[hidden] {
           display: none !important;
         }
-        .zpdf-modal {
-          background: var(--zpdf-bg);
-          color: var(--zpdf-fg);
-          border: 1px solid var(--zpdf-border);
-          border-radius: 10px;
-          width: 560px;
-          max-width: 92vw;
-          max-height: 84vh;
-          display: flex;
-          flex-direction: column;
-          box-shadow: 0 20px 45px rgba(0, 0, 0, 0.42);
-          overflow: hidden;
+        .zpdf-modal,
+        .zpdf-modal.label-popup.preview-popup {
+          position: relative !important;
+          left: auto !important;
+          top: auto !important;
+          background: var(--zpdf-bg) !important;
+          color: var(--zpdf-fg) !important;
+          border: 1px solid var(--zpdf-border) !important;
+          border-radius: 10px !important;
+          width: 560px !important;
+          max-width: 92vw !important;
+          max-height: 84vh !important;
+          display: flex !important;
+          flex-direction: column !important;
+          box-shadow: 0 20px 45px rgba(0, 0, 0, 0.42) !important;
+          overflow: hidden !important;
           color-scheme: var(--zpdf-color-scheme);
+          -moz-user-select: text !important;
+          user-select: text !important;
+        }
+        .zpdf-modal.label-popup.preview-popup::before,
+        .zpdf-modal.label-popup.preview-popup::after {
+          display: none !important;
+          content: none !important;
         }
         .zpdf-modal-header {
           display: flex;
@@ -1489,7 +1634,11 @@ class ZoteroPDFDefinitions {
       const defaults = inferDefaultMatchOptions(selectedTerm);
 
       const container = doc.createElement("div");
-      container.className = "zpdf-selection-box";
+      // Zoteros KeyboardManager & FocusManager prüfen im Capture-Phase-Keydown-Listener
+      // auf `event.target.closest('input, .label-popup')` sowie `[contenteditable], .preview-popup`.
+      // Ohne diese Klassen ruft Zotero bei Backspace/Delete `deleteAnnotations([])` auf,
+      // was die aktuelle Auswahl verwirft und das Auswahl-Popup sofort schließt.
+      container.className = "zpdf-selection-box label-popup preview-popup";
 
       // Kopfzeile mit Titel + Dark/Light/Auto-Umschalter
       const header = doc.createElement("div");
@@ -1528,6 +1677,7 @@ class ZoteroPDFDefinitions {
       const termInput = doc.createElement("input");
       termInput.type = "text";
       termInput.className = "zpdf-input";
+      termInput.setAttribute("contenteditable", "true");
       termInput.value = loadedDef ? loadedDef.term : selectedTerm;
       termInput.placeholder = "Ausdruck / Buchstabe…";
       termInput.title = "Ausdruck, der im PDF erkannt werden soll";
@@ -1536,6 +1686,7 @@ class ZoteroPDFDefinitions {
       // Eingabefeld für die Definition
       const defInput = doc.createElement("textarea");
       defInput.className = "zpdf-textarea";
+      defInput.setAttribute("contenteditable", "true");
       defInput.value = loadedDef ? loadedDef.definition : "";
       defInput.placeholder = "Definition eingeben… (Strg+Enter)";
       container.appendChild(defInput);
@@ -1805,6 +1956,8 @@ class ZoteroPDFDefinitions {
           performSave();
         }
       });
+      defInput.addEventListener("keyup", (e) => e.stopPropagation());
+      defInput.addEventListener("keypress", (e) => e.stopPropagation());
       termInput.addEventListener("keydown", (e) => {
         e.stopPropagation();
         if (e.key === "Enter") {
@@ -1812,6 +1965,8 @@ class ZoteroPDFDefinitions {
           performSave();
         }
       });
+      termInput.addEventListener("keyup", (e) => e.stopPropagation());
+      termInput.addEventListener("keypress", (e) => e.stopPropagation());
 
       btnRow.appendChild(saveBtn);
       container.appendChild(btnRow);
@@ -1908,7 +2063,7 @@ class ZoteroPDFDefinitions {
     const renderModalContent = (editDef = initialEditDef, filterText = "") => {
       modalBackdrop.replaceChildren();
       const modal = doc.createElement("div");
-      modal.className = "zpdf-modal";
+      modal.className = "zpdf-modal label-popup preview-popup";
 
       // Header
       const header = doc.createElement("div");
@@ -1972,12 +2127,13 @@ class ZoteroPDFDefinitions {
       hintCb.checked = Boolean(this.subtleHint);
       hintCb.addEventListener("change", () => {
         this.subtleHint = hintCb.checked;
+        this._defsStamp = (this._defsStamp || 0) + 1;
         this.saveStore();
         this.refreshAllReaders();
       });
       const hintSpan = doc.createElement("span");
       hintSpan.textContent =
-        "Dezente gepunktete Linie unter definierten Begriffen zeigen (Standard: komplett unsichtbar)";
+        "Dezente gepunktete Linie unter definierten Begriffen im PDF anzeigen";
       hintLbl.appendChild(hintCb);
       hintLbl.appendChild(hintSpan);
       settingsBar.appendChild(hintLbl);
@@ -1998,8 +2154,11 @@ class ZoteroPDFDefinitions {
       const termInput = doc.createElement("input");
       termInput.type = "text";
       termInput.className = "zpdf-input";
+      termInput.setAttribute("contenteditable", "true");
       termInput.placeholder = "Ausdruck, Buchstabe, Symbol oder Wortgruppe…";
       termInput.value = editDef ? editDef.term : prefillTerm;
+      termInput.addEventListener("keydown", (e) => e.stopPropagation());
+      termInput.addEventListener("keyup", (e) => e.stopPropagation());
       formBox.appendChild(termInput);
 
       const modalDupWarning = doc.createElement("div");
@@ -2009,8 +2168,11 @@ class ZoteroPDFDefinitions {
 
       const defInput = doc.createElement("textarea");
       defInput.className = "zpdf-textarea";
+      defInput.setAttribute("contenteditable", "true");
       defInput.placeholder = "Definition / Erklärung…";
       defInput.value = editDef ? editDef.definition : "";
+      defInput.addEventListener("keydown", (e) => e.stopPropagation());
+      defInput.addEventListener("keyup", (e) => e.stopPropagation());
       formBox.appendChild(defInput);
 
       const defaults = inferDefaultMatchOptions(termInput.value || "wort");
@@ -2145,10 +2307,13 @@ class ZoteroPDFDefinitions {
 
       // Suchfeld für bestehende Definitionen
       const searchInput = doc.createElement("input");
-      searchInput.type = "search";
+      searchInput.type = "text";
       searchInput.className = "zpdf-input";
+      searchInput.setAttribute("contenteditable", "true");
       searchInput.placeholder = "Definitionen durchsuchen…";
       searchInput.value = filterText;
+      searchInput.addEventListener("keydown", (e) => e.stopPropagation());
+      searchInput.addEventListener("keyup", (e) => e.stopPropagation());
       searchInput.addEventListener("input", () => {
         renderList(searchInput.value);
       });
@@ -2327,21 +2492,21 @@ class ZoteroPDFDefinitions {
 
   attachToReaderViews(reader) {
     try {
-      const internalReader =
-        reader._internalReader?.wrappedJSObject || reader._internalReader;
+      const internalReader = waive(reader._internalReader);
       if (!internalReader) return;
 
       const views = [internalReader._primaryView, internalReader._secondaryView].filter(
         Boolean
       );
       for (const pdfView of views) {
-        const unwrappedView = pdfView.wrappedJSObject || pdfView;
-        const pdfWin = unwrappedView?._iframeWindow;
-        if (!pdfWin || !pdfWin.document || !pdfWin.PDFViewerApplication) continue;
+        const waivedView = waive(pdfView);
+        const rawPdfWin = waivedView?._iframeWindow;
+        const pdfWin = unwaive(rawPdfWin);
+        if (!pdfWin || !pdfWin.document) continue;
 
-        if (!this._hookedPdfViews.has(unwrappedView)) {
-          this._hookedPdfViews.add(unwrappedView);
-          this.setupPdfViewHooks(reader, unwrappedView, pdfWin);
+        if (!this._hookedPdfViews.has(waivedView)) {
+          this._hookedPdfViews.add(waivedView);
+          this.setupPdfViewHooks(reader, waivedView, pdfWin, rawPdfWin);
         }
       }
     } catch (err) {
@@ -2350,21 +2515,34 @@ class ZoteroPDFDefinitions {
   }
 
   /**
-   * Richtet in `pdf/web/viewer.html` (`pdfWin`) das CSS für unsichtbare Markierungen,
+   * Richtet in `pdf/web/viewer.html` (`pdfWin`) das CSS für unsichtbare/gepunktete Markierungen,
    * Event-Listener für `pagerendered`/`textlayerrendered` sowie den passiven
    * `pointermove`-Hover-Detektor ein.
    */
-  setupPdfViewHooks(reader, pdfView, pdfWin) {
-    const pdfDoc = pdfWin.document;
-    if (pdfDoc?.documentElement) {
+  setupPdfViewHooks(reader, pdfView, pdfWin, rawPdfWin) {
+    const waivedView = waive(pdfView);
+    const cleanPdfWin = unwaive(pdfWin || waivedView?._iframeWindow);
+    const pdfDoc = cleanPdfWin?.document;
+    if (!pdfDoc) return;
+
+    if (pdfDoc.documentElement) {
       pdfDoc.documentElement.setAttribute(
         "data-zpdf-theme",
         this.resolveEffectiveTheme(reader)
       );
     }
-    if (!pdfDoc.getElementById("zpdf-inner-viewer-styles")) {
-      const style = pdfDoc.createElement("style");
-      style.id = "zpdf-inner-viewer-styles";
+
+    let style = pdfDoc.getElementById("zpdf-inner-viewer-styles");
+    const styleVer = this.version || "1.0.6";
+    if (!style || style.dataset?.zpdfVersion !== styleVer) {
+      if (!style) {
+        style = pdfDoc.createElement("style");
+        style.id = "zpdf-inner-viewer-styles";
+        pdfDoc.head.appendChild(style);
+      }
+      if (style.dataset) {
+        style.dataset.zpdfVersion = styleVer;
+      }
       style.textContent = `
         .zpdf-def-layer {
           position: absolute;
@@ -2379,64 +2557,110 @@ class ZoteroPDFDefinitions {
           border-radius: 2px;
           box-sizing: border-box;
           background: transparent;
-          border-bottom: 1.5px dotted transparent;
+          border-bottom: 2px dotted transparent;
           transition: background-color 0.1s ease, border-color 0.1s ease;
         }
         .zpdf-def-layer.zpdf-subtle-hint .zpdf-def-mark {
-          border-bottom-color: rgba(99, 102, 241, 0.48);
+          border-bottom: 2px dotted rgba(79, 70, 229, 0.78) !important;
         }
         :root[data-zpdf-theme="dark"] .zpdf-def-layer.zpdf-subtle-hint .zpdf-def-mark {
-          border-bottom-color: rgba(129, 140, 248, 0.65);
+          border-bottom: 2px dotted rgba(129, 140, 248, 0.85) !important;
         }
         .zpdf-def-mark.zpdf-def-mark-hovered {
           background-color: rgba(56, 189, 248, 0.22) !important;
           border-bottom: 2px solid #0284c7 !important;
         }
         :root[data-zpdf-theme="dark"] .zpdf-def-mark.zpdf-def-mark-hovered {
-          background-color: rgba(56, 189, 248, 0.28) !important;
+          background-color: rgba(56, 189, 248, 0.32) !important;
           border-bottom: 2px solid #38bdf8 !important;
         }
       `;
-      pdfDoc.head.appendChild(style);
     }
 
-    const eventBus = pdfWin.PDFViewerApplication?.eventBus;
+    const waivedApp = waive(waivedView?._iframeWindow?.PDFViewerApplication || rawPdfWin?.PDFViewerApplication);
+    const eventBus = waivedApp?.eventBus;
     if (eventBus && typeof eventBus.on === "function") {
-      eventBus.on("pagerendered", (evt) => {
+      const safeRegister = (eventName, fn) => {
+        try {
+          let exported = fn;
+          if (
+            typeof Components !== "undefined" &&
+            typeof Components.utils?.exportFunction === "function"
+          ) {
+            exported = Components.utils.exportFunction(fn, cleanPdfWin);
+          }
+          eventBus.on(eventName, exported);
+        } catch (_) {
+          try {
+            eventBus.on(eventName, fn);
+          } catch (e) {}
+        }
+      };
+
+      safeRegister("pagerendered", (evt) => {
         const pageIndex = (evt?.pageNumber || 1) - 1;
-        this.indexAndRenderPage(reader, pdfView, pageIndex);
+        this.indexAndRenderPage(reader, waivedView, pageIndex);
+        cleanPdfWin.setTimeout?.(() => {
+          this.indexAndRenderPage(reader, waivedView, pageIndex);
+        }, 180);
+        cleanPdfWin.setTimeout?.(() => {
+          this.indexAndRenderPage(reader, waivedView, pageIndex);
+        }, 600);
       });
-      eventBus.on("textlayerrendered", (evt) => {
+
+      safeRegister("textlayerrendered", (evt) => {
         const pageIndex = (evt?.pageNumber || 1) - 1;
-        this.indexAndRenderPage(reader, pdfView, pageIndex);
+        this.indexAndRenderPage(reader, waivedView, pageIndex);
+        cleanPdfWin.setTimeout?.(() => {
+          this.indexAndRenderPage(reader, waivedView, pageIndex);
+        }, 150);
       });
-      eventBus.on("documentinit", () => {
-        this.refreshPdfView(reader, pdfView);
+
+      safeRegister("documentinit", () => {
+        this.refreshPdfView(reader, waivedView);
       });
-      eventBus.on("pagesloaded", () => {
-        this.refreshPdfView(reader, pdfView);
+
+      safeRegister("pagesloaded", () => {
+        this.refreshPdfView(reader, waivedView);
+        cleanPdfWin.setTimeout?.(() => {
+          this.refreshPdfView(reader, waivedView);
+        }, 300);
       });
     }
 
-    // Passiver Pointer-Move-Listener für verzögerungsfreie Hover-Erkennung ohne Blockieren der Textauswahl
-    pdfWin.addEventListener(
-      "pointermove",
-      (evt) => {
-        this.onPdfPointerMove(reader, pdfView, pdfWin, evt);
-      },
-      { passive: true }
-    );
+    // Passiver Pointer-Move-Listener auf Dokument & Window für verzögerungsfreie Hover-Erkennung
+    try {
+      pdfDoc.addEventListener(
+        "pointermove",
+        (evt) => {
+          this.onPdfPointerMove(reader, waivedView, cleanPdfWin, evt);
+        },
+        { passive: true }
+      );
+    } catch (_) {
+      try {
+        cleanPdfWin.addEventListener(
+          "pointermove",
+          (evt) => {
+            this.onPdfPointerMove(reader, waivedView, cleanPdfWin, evt);
+          },
+          { passive: true }
+        );
+      } catch (e) {}
+    }
 
-    pdfWin.addEventListener(
-      "scroll",
-      () => {
-        this.hideTooltipImmediately(reader);
-      },
-      { passive: true, capture: true }
-    );
+    try {
+      cleanPdfWin.addEventListener(
+        "scroll",
+        () => {
+          this.hideTooltipImmediately(reader);
+        },
+        { passive: true, capture: true }
+      );
+    } catch (_) {}
 
     // Direkt alle bereits gerenderten Seiten einmal indexieren
-    this.refreshPdfView(reader, pdfView);
+    this.refreshPdfView(reader, waivedView);
   }
 
   /**
@@ -2447,14 +2671,13 @@ class ZoteroPDFDefinitions {
     for (const reader of readers) {
       if (!reader || reader.type !== "pdf" || !reader._iframeWindow) continue;
       this.updateToolbarBadge(reader);
-      const internalReader =
-        reader._internalReader?.wrappedJSObject || reader._internalReader;
+      const internalReader = waive(reader._internalReader);
       if (!internalReader) continue;
       const views = [internalReader._primaryView, internalReader._secondaryView].filter(
         Boolean
       );
       for (const v of views) {
-        this.refreshPdfView(reader, v.wrappedJSObject || v);
+        this.refreshPdfView(reader, waive(v));
       }
     }
   }
@@ -2474,14 +2697,19 @@ class ZoteroPDFDefinitions {
 
   refreshPdfView(reader, pdfView) {
     try {
-      const pdfWin = pdfView?._iframeWindow;
-      const pages = pdfWin?.PDFViewerApplication?.pdfViewer?._pages;
-      if (!Array.isArray(pages)) return;
+      const waivedView = waive(pdfView);
+      const waivedApp = waive(waivedView?._iframeWindow?.PDFViewerApplication);
+      const pages = waivedApp?.pdfViewer?._pages;
+      if (!pages || typeof pages.length !== "number") return;
 
       for (let i = 0; i < pages.length; i++) {
         const pageView = pages[i];
-        if (pageView && pageView.div && pageView.renderingState === 3) {
-          this.indexAndRenderPage(reader, pdfView, i);
+        if (pageView && pageView.div) {
+          const div = unwaive(pageView.div);
+          const isRendered = pageView.renderingState === 3 || div.querySelector?.(".textLayer");
+          if (isRendered) {
+            this.indexAndRenderPage(reader, waivedView, i);
+          }
         }
       }
     } catch (err) {
@@ -2491,67 +2719,94 @@ class ZoteroPDFDefinitions {
 
   /**
    * Extrahiert die Zeichen einer PDF-Seite (über Zoteros `_ensureBasicPageData` + `_pdfPages[pageIndex].chars`,
-   * mit Fallback auf PDF.js `getTextContent()`) und legt für jedes Vorkommen eines definierten
-   * Ausdrucks ein unsichtbares Markierungs-Element `.zpdf-def-mark` auf der Seite an.
+   * mit Fallback auf PDF.js `getTextContent()` und DOM `.textLayer`) und legt für jedes Vorkommen
+   * eines definierten Ausdrucks ein Markierungs-Element `.zpdf-def-mark` auf der Seite an.
    */
   async indexAndRenderPage(reader, pdfView, pageIndex) {
     try {
-      const pdfWin = pdfView?._iframeWindow;
-      const pages = pdfWin?.PDFViewerApplication?.pdfViewer?._pages;
+      const waivedView = waive(pdfView);
+      const rawPdfWin = waivedView?._iframeWindow;
+      const cleanPdfWin = unwaive(rawPdfWin);
+      const waivedApp = waive(rawPdfWin?.PDFViewerApplication);
+      const pages = waivedApp?.pdfViewer?._pages;
       const pageView = pages?.[pageIndex];
       if (!pageView || !pageView.div || !pageView.viewport) return;
 
+      const pageDiv = unwaive(pageView.div);
+      const pdfDoc = unwaive(cleanPdfWin?.document || pageDiv.ownerDocument);
+      if (!pdfDoc) return;
+
       const docKey = this.getDocKey(reader);
       const activeDefs = this.getActiveDefinitionsForDoc(docKey);
-      const pdfDoc = pdfWin.document;
 
-      let layer = pageView.div.querySelector(":scope > .zpdf-def-layer");
+      let layer = pageDiv.querySelector(":scope > .zpdf-def-layer");
       if (!activeDefs.length) {
         if (layer) layer.replaceChildren();
+        return;
+      }
+
+      const scale = String(pageView.viewport.scale || 1);
+      const rotation = String(pageView.viewport.rotation || 0);
+      const currentStamp = `${docKey}|${this._defsStamp || 1}|${this.subtleHint ? "hint" : "nohint"}|${scale}|${rotation}`;
+
+      if (layer && layer.dataset.zpdfIndexedStamp === currentStamp) {
+        // Bereits mit aktuellem Stand & Skalierung indexiert
         return;
       }
 
       if (!layer) {
         layer = pdfDoc.createElement("div");
         layer.className = "zpdf-def-layer";
-        pageView.div.appendChild(layer);
+        pageDiv.appendChild(layer);
       }
       layer.classList.toggle("zpdf-subtle-hint", Boolean(this.subtleHint));
-      layer.dataset.scale = String(pageView.viewport.scale || 1);
-      layer.dataset.rotation = String(pageView.viewport.rotation || 0);
+      layer.dataset.scale = scale;
+      layer.dataset.rotation = rotation;
 
       // 1. Zoteros eigene Seitendaten (`_pdfPages[pageIndex].chars`) laden
       if (
-        !pdfView._pdfPages?.[pageIndex]?.chars &&
-        typeof pdfView._ensureBasicPageData === "function"
+        !waivedView._pdfPages?.[pageIndex]?.chars &&
+        typeof waivedView._ensureBasicPageData === "function"
       ) {
         try {
-          await pdfView._ensureBasicPageData(pageIndex);
+          await awaitContentPromise(waivedView._ensureBasicPageData(pageIndex), rawPdfWin);
         } catch (_) {}
       }
 
-      let chars = pdfView._pdfPages?.[pageIndex]?.chars;
+      let chars = waivedView._pdfPages?.[pageIndex]?.chars;
 
-      // 2. Fallback über PDF.js `pdfPage.getTextContent()`, falls `_pdfPages` leer sein sollte
-      if ((!Array.isArray(chars) || chars.length === 0) && pageView.pdfPage?.getTextContent) {
-        chars = await this.extractCharsFromPdfJsTextContent(pageView.pdfPage);
+      // 2. Fallback über PDF.js `pdfPage.getTextContent()`, falls `_pdfPages` noch leer ist
+      if (
+        (!chars || !chars.length) &&
+        pageView.pdfPage &&
+        typeof pageView.pdfPage.getTextContent === "function"
+      ) {
+        chars = await this.extractCharsFromPdfJsTextContent(pageView.pdfPage, rawPdfWin);
       }
 
-      if (!Array.isArray(chars) || chars.length === 0) return;
+      // 3. Fallback über den gerenderten DOM `.textLayer`
+      if (!chars || !chars.length) {
+        chars = this.extractCharsFromDomTextLayer(pageDiv, pageView.viewport);
+      }
+
+      if (!chars || !chars.length) {
+        // Noch keine Zeichendaten verfügbar – Stempel noch nicht setzen, damit spätere Events nachladen
+        return;
+      }
 
       const matches = findMatchesInPageChars(chars, activeDefs);
       layer.replaceChildren();
 
       for (const m of matches) {
         for (const pdfRect of m.rects) {
-          const vpRect = pageView.viewport.convertToViewportRectangle(pdfRect);
-          if (!Array.isArray(vpRect) || vpRect.length < 4) continue;
+          const vpRect = convertPdfRectToViewport(pageView.viewport, pdfRect);
+          if (!vpRect || typeof vpRect.length !== "number" || vpRect.length < 4) continue;
 
-          const left = Math.min(vpRect[0], vpRect[2]);
-          const top = Math.min(vpRect[1], vpRect[3]);
-          const width = Math.abs(vpRect[2] - vpRect[0]);
-          const height = Math.abs(vpRect[3] - vpRect[1]);
-          if (width <= 0 || height <= 0) continue;
+          const left = Math.min(Number(vpRect[0]), Number(vpRect[2]));
+          const top = Math.min(Number(vpRect[1]), Number(vpRect[3]));
+          const width = Math.abs(Number(vpRect[2]) - Number(vpRect[0]));
+          const height = Math.abs(Number(vpRect[3]) - Number(vpRect[1]));
+          if (width <= 0 || height <= 0 || Number.isNaN(left) || Number.isNaN(top)) continue;
 
           const mark = pdfDoc.createElement("div");
           mark.className = "zpdf-def-mark";
@@ -2559,10 +2814,14 @@ class ZoteroPDFDefinitions {
           mark.style.top = `${top.toFixed(1)}px`;
           mark.style.width = `${width.toFixed(1)}px`;
           mark.style.height = `${height.toFixed(1)}px`;
+          // Eindeutige ID als HTML-Attribut speichern (übersteht XrayWrappers sauber)
+          mark.setAttribute("data-zpdf-def-id", m.def.id);
           mark._zpdfDef = m.def;
           layer.appendChild(mark);
         }
       }
+
+      layer.dataset.zpdfIndexedStamp = currentStamp;
     } catch (err) {
       this.log(`indexAndRenderPage(${pageIndex}) Fehler: ${err}`);
     }
@@ -2571,17 +2830,20 @@ class ZoteroPDFDefinitions {
   /**
    * Fallback-Konverter von PDF.js `getTextContent()` nach `chars`-Format.
    */
-  async extractCharsFromPdfJsTextContent(pdfPage) {
+  async extractCharsFromPdfJsTextContent(pdfPage, contentWin) {
     try {
-      const tc = await pdfPage.getTextContent();
+      const tc = await awaitContentPromise(pdfPage.getTextContent(), contentWin);
+      if (!tc || !tc.items) return [];
       const chars = [];
-      for (const item of tc.items || []) {
-        const str = item.str || "";
+      const items = tc.items;
+      for (let itemIdx = 0; itemIdx < items.length; itemIdx++) {
+        const item = items[itemIdx];
+        const str = String(item.str || "");
         if (!str) continue;
-        const tx = item.transform?.[4] || 0;
-        const ty = item.transform?.[5] || 0;
-        const h = Math.abs(item.height || item.transform?.[3] || 10);
-        const w = Math.abs(item.width || str.length * (h * 0.5));
+        const tx = Number(item.transform?.[4] || 0);
+        const ty = Number(item.transform?.[5] || 0);
+        const h = Math.abs(Number(item.height || item.transform?.[3] || 10));
+        const w = Math.abs(Number(item.width || str.length * (h * 0.5)));
         const charW = str.length > 0 ? w / str.length : w;
 
         for (let i = 0; i < str.length; i++) {
@@ -2606,45 +2868,110 @@ class ZoteroPDFDefinitions {
   }
 
   /**
-   * Prüft bei Mausbewegung über das PDF, ob sich der Mauszeiger über einer (unsichtbar)
+   * 3. Fallback: Liest die Zeichen direkt aus dem DOM `.textLayer` der Seite.
+   */
+  extractCharsFromDomTextLayer(pageDiv, viewport) {
+    try {
+      const textLayer = pageDiv.querySelector?.(".textLayer");
+      if (!textLayer) return [];
+      const spans = textLayer.children;
+      if (!spans || !spans.length) return [];
+      const chars = [];
+      const pageRect = pageDiv.getBoundingClientRect();
+      const hasConvert = typeof viewport?.convertToPdfPoint === "function";
+
+      for (let sIdx = 0; sIdx < spans.length; sIdx++) {
+        const span = spans[sIdx];
+        if (!span || span.classList?.contains("endOfContent") || !span.textContent) continue;
+        const text = span.textContent;
+        const sRect = span.getBoundingClientRect();
+        const vx1 = sRect.left - pageRect.left;
+        const vy1 = sRect.top - pageRect.top;
+        const vx2 = sRect.right - pageRect.left;
+        const vy2 = sRect.bottom - pageRect.top;
+
+        let pdfRect;
+        if (hasConvert) {
+          const p1 = viewport.convertToPdfPoint(vx1, vy2);
+          const p2 = viewport.convertToPdfPoint(vx2, vy1);
+          pdfRect = [
+            Math.min(p1[0], p2[0]),
+            Math.min(p1[1], p2[1]),
+            Math.max(p1[0], p2[0]),
+            Math.max(p1[1], p2[1]),
+          ];
+        } else {
+          pdfRect = [vx1, vy1, vx2, vy2];
+        }
+        const w = (pdfRect[2] - pdfRect[0]) / (text.length || 1);
+        for (let i = 0; i < text.length; i++) {
+          const x1 = pdfRect[0] + i * w;
+          const x2 = x1 + w;
+          const r = [x1, pdfRect[1], x2, pdfRect[3]];
+          chars.push({
+            c: text[i],
+            u: text[i],
+            ignorable: false,
+            spaceAfter: i === text.length - 1,
+            lineBreakAfter: i === text.length - 1,
+            rect: r,
+            inlineRect: r,
+          });
+        }
+      }
+      return chars;
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /**
+   * Prüft bei Mausbewegung über das PDF, ob sich der Mauszeiger über einer (unsichtbar/gepunktet)
    * markierten Stelle `.zpdf-def-mark` befindet, und blendet den Tooltip mit der Definition ein.
    */
   onPdfPointerMove(reader, pdfView, pdfWin, evt) {
+    const rawEvt = unwaive(evt);
     // Während der Nutzer aktiv mit gedrückter Maustaste Text markiert, keinen Tooltip öffnen
-    if (evt.buttons !== 0) {
+    if (rawEvt.buttons !== 0) {
       this.hideTooltipImmediately(reader);
       return;
     }
 
-    const clientX = evt.clientX;
-    const clientY = evt.clientY;
-    const pdfDoc = pdfWin.document;
+    const clientX = rawEvt.clientX;
+    const clientY = rawEvt.clientY;
 
-    // Seite unter dem Mauszeiger ermitteln
-    const targetEl = evt.target instanceof pdfWin.Element ? evt.target : null;
-    const pageEl = targetEl?.closest?.(".page");
+    // Ziel-Element unter dem Mauszeiger sicher ermitteln (über Compartment-Grenzen hinweg)
+    const rawTarget = unwaive(rawEvt.target);
+    const elTarget =
+      rawTarget && typeof rawTarget.closest === "function"
+        ? rawTarget
+        : rawTarget?.parentElement;
+    const pageEl = elTarget?.closest?.(".page");
     if (!pageEl) {
       this.scheduleHideTooltip(reader, 140);
       return;
     }
 
+    const waivedView = waive(pdfView);
+    const cleanPdfWin = unwaive(pdfWin || waivedView?._iframeWindow);
     const layer = pageEl.querySelector(":scope > .zpdf-def-layer");
     const pageNum = parseInt(pageEl.getAttribute("data-page-number") || "0", 10);
     const pageView =
       pageNum > 0
-        ? pdfWin?.PDFViewerApplication?.pdfViewer?._pages?.[pageNum - 1]
+        ? waive(waivedView?._iframeWindow?.PDFViewerApplication?.pdfViewer?._pages?.[pageNum - 1])
         : null;
+
     const scaleMismatch =
       layer &&
       pageView?.viewport &&
       (layer.dataset.scale !== String(pageView.viewport.scale || 1) ||
         layer.dataset.rotation !== String(pageView.viewport.rotation || 0));
 
-    if (!layer || scaleMismatch) {
+    if (!layer || scaleMismatch || !layer.dataset.zpdfIndexedStamp) {
       // Falls Seite noch keine Layer hat oder Zoom sich geändert hat, im Hintergrund indexieren
       if (pageNum > 0 && !pageEl._zpdfIndexing) {
         pageEl._zpdfIndexing = true;
-        this.indexAndRenderPage(reader, pdfView, pageNum - 1).finally(() => {
+        this.indexAndRenderPage(reader, waivedView, pageNum - 1).finally(() => {
           pageEl._zpdfIndexing = false;
         });
       }
@@ -2674,14 +3001,21 @@ class ZoteroPDFDefinitions {
       reader._zpdfLastHoveredMark = null;
     }
 
-    if (!hitMark || !hitMark._zpdfDef) {
+    if (!hitMark) {
+      this.scheduleHideTooltip(reader, 180);
+      return;
+    }
+
+    const defId = hitMark.getAttribute("data-zpdf-def-id");
+    const def = (defId ? this.definitions.find((d) => d.id === defId) : null) || hitMark._zpdfDef;
+    if (!def) {
       this.scheduleHideTooltip(reader, 180);
       return;
     }
 
     hitMark.classList.add("zpdf-def-mark-hovered");
     reader._zpdfLastHoveredMark = hitMark;
-    this.showDefinitionTooltip(reader, pdfView, hitMark, hitMark._zpdfDef);
+    this.showDefinitionTooltip(reader, waivedView, hitMark, def);
   }
 
   /**
@@ -2698,8 +3032,9 @@ class ZoteroPDFDefinitions {
       tooltip._hideTimer = null;
     }
 
-    const iframeEl = pdfView._iframe;
-    const iframeRect = iframeEl
+    const waivedView = waive(pdfView);
+    const iframeEl = unwaive(waivedView?._iframe || waivedView?._iframeWindow?.frameElement);
+    const iframeRect = iframeEl?.getBoundingClientRect
       ? iframeEl.getBoundingClientRect()
       : { left: 0, top: 0 };
     const markRect = markEl.getBoundingClientRect();
@@ -2749,7 +3084,7 @@ class ZoteroPDFDefinitions {
         });
         if (updated) {
           tooltip._currentUpdatedAt = null;
-          this.showDefinitionTooltip(reader, pdfView, markEl, updated);
+          this.showDefinitionTooltip(reader, waivedView, markEl, updated);
         }
       });
       actionsRow.appendChild(scopeToggleBtn);
@@ -2866,14 +3201,13 @@ class ZoteroPDFDefinitions {
           }
         }
       }
-      const internalReader =
-        reader?._internalReader?.wrappedJSObject || reader?._internalReader;
+      const internalReader = waive(reader?._internalReader);
       const views = [internalReader?._primaryView, internalReader?._secondaryView].filter(
         Boolean
       );
       for (const v of views) {
-        const uw = v.wrappedJSObject || v;
-        const pDoc = uw?._iframeWindow?.document;
+        const uw = waive(v);
+        const pDoc = unwaive(uw?._iframeWindow?.document);
         if (pDoc) {
           pDoc.documentElement?.removeAttribute("data-zpdf-theme");
           pDoc.getElementById("zpdf-inner-viewer-styles")?.remove();
@@ -2899,5 +3233,8 @@ if (typeof module !== "undefined" && module.exports) {
     buildSearchableTextFromChars,
     computeRectsFromCharsSlice,
     findMatchesInPageChars,
+    convertPdfRectToViewport,
+    unwaive,
+    waive,
   };
 }
